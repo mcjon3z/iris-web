@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-#
 #  IRIS Source Code
 #  Copyright (C) 2021 - Airbus CyberSecurity (SAS)
 #  ir@cyberactionlab.net
@@ -189,6 +187,8 @@ class CaseAssets(db.Model):
     analysis_status_id = Column(ForeignKey('analysis_status.id'))
     custom_attributes = Column(JSON)
     asset_enrichment = Column(JSONB)
+    modification_history = Column(JSON)
+
 
     case = relationship('Cases')
     user = relationship('User')
@@ -413,6 +413,7 @@ class Ioc(db.Model):
     ioc_tlp_id = Column(ForeignKey('tlp.tlp_id'))
     custom_attributes = Column(JSON)
     ioc_enrichment = Column(JSONB)
+    modification_history = Column(JSON)
 
     user = relationship('User')
     tlp = relationship('Tlp')
@@ -534,6 +535,7 @@ class Notes(db.Model):
     note_case_id = Column(ForeignKey('cases.case_id'))
     custom_attributes = Column(JSON)
     directory_id = Column(ForeignKey('note_directory.id'), nullable=True)
+    modification_history = Column(JSON)
 
     user = relationship('User')
     case = relationship('Cases')
@@ -608,6 +610,7 @@ class CaseReceivedFile(db.Model):
     type_id = Column(ForeignKey('evidence_type.id'))
     custom_attributes = Column(JSON)
     chain_of_custody = Column(JSON)
+    modification_history = Column(JSON)
 
     case = relationship('Cases')
     user = relationship('User')
@@ -640,6 +643,7 @@ class CaseTasks(db.Model):
     task_status_id = Column(ForeignKey('task_status.id'))
     task_case_id = Column(ForeignKey('cases.case_id'))
     custom_attributes = Column(JSON)
+    modification_history = Column(JSON)
 
     case = relationship('Cases')
     user_open = relationship('User', foreign_keys=[task_userid_open])

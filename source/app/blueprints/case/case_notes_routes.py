@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-#
 #  IRIS Source Code
 #  Copyright (C) 2021 - Airbus CyberSecurity (SAS) - DFIR-IRIS Team
 #  ir@cyberactionlab.net - contact@dfir-iris.org
@@ -50,7 +48,7 @@ from app.models.authorization import CaseAccessLevel
 from app.schema.marshables import CaseNoteDirectorySchema
 from app.schema.marshables import CaseNoteSchema
 from app.schema.marshables import CommentSchema
-from app.util import ac_api_case_requires, ac_socket_requires, endpoint_deprecated
+from app.util import ac_api_case_requires, ac_socket_requires, endpoint_deprecated, add_obj_history_entry
 from app.util import ac_case_requires
 from app.util import response_error
 from app.util import response_success
@@ -170,6 +168,7 @@ def case_note_save(cur_id, caseid):
         note.update_date = datetime.utcnow()
         note.user_id = current_user.id
 
+        add_obj_history_entry(note, 'updated note', commit=True)
         note = call_modules_hook('on_postload_note_update', data=note, caseid=caseid)
 
     except marshmallow.exceptions.ValidationError as e:
@@ -203,6 +202,8 @@ def case_note_add(caseid):
 
         db.session.add(new_note)
         db.session.commit()
+
+        add_obj_history_entry(new_note, 'created note', commit=True)
 
         new_note = call_modules_hook('on_postload_note_create', data=new_note, caseid=caseid)
 
