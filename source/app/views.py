@@ -30,6 +30,7 @@ from app.blueprints.api.api_routes import api_blueprint
 from app.blueprints.case.case_routes import case_blueprint
 from app.blueprints.context.context import ctx_blueprint
 # Blueprints
+from app.blueprints.graphql.graphql_route import graphql_blueprint
 from app.blueprints.dashboard.dashboard_routes import dashboard_blueprint
 from app.blueprints.datastore.datastore_routes import datastore_blueprint
 from app.blueprints.demo_landing.demo_landing import demo_blueprint
@@ -67,6 +68,8 @@ from app.blueprints.search.search_routes import search_blueprint
 from app.models.authorization import User
 from app.post_init import run_post_init
 
+
+app.register_blueprint(graphql_blueprint)
 app.register_blueprint(dashboard_blueprint)
 app.register_blueprint(overview_blueprint)
 app.register_blueprint(login_blueprint)
@@ -124,31 +127,28 @@ def load_user(user_id):
     return User.query.get(int(user_id))
 
 
+def _get_user_by_api_key(api_key):
+    if not api_key:
+        return None
+
+    api_key = api_key.replace('Bearer ', '', 1)
+    return User.query.filter(
+        User.api_key == api_key,
+        User.active == True
+    ).first()
+
+
 @lm.request_loader
 def load_user_from_request(request):
+    api_key_sources = [
+        request.headers.get('X-IRIS-AUTH'),
+        request.headers.get('Authorization')
+    ]
 
-    # first, try to login using the api_key url arg
-    api_key = request.args.get('api_key')
-    if api_key:
-        user = User.query.filter(
-            User.api_key == api_key,
-            User.active == True
-        ).first()
-        if user:
-            return user
+    for api_key in api_key_sources:
+        if api_key:
+            user = _get_user_by_api_key(api_key)
+            if user:
+                return user
 
-    # next, try to login using Basic Auth
-    api_key = request.headers.get('Authorization')
-    if api_key:
-        api_key = api_key.replace('Bearer ', '', 1)
-
-        user = User.query.filter(
-            User.api_key == api_key,
-            User.active == True
-        ).first()
-
-        if user:
-            return user
-
-    # finally, return None if both methods did not login the user
     return None

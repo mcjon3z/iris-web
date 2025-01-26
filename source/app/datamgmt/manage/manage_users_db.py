@@ -31,7 +31,7 @@ from app.iris_engine.access_control.utils import ac_auto_update_user_effective_a
 from app.iris_engine.access_control.utils import ac_get_detailed_effective_permissions_from_groups
 from app.iris_engine.access_control.utils import ac_remove_case_access_from_user
 from app.iris_engine.access_control.utils import ac_set_case_access_for_user
-from app.models import Cases, Client
+from app.models import Cases, Client, UserActivity
 from app.models.authorization import CaseAccessLevel, UserClient
 from app.models.authorization import Group
 from app.models.authorization import Organisation
@@ -42,17 +42,22 @@ from app.models.authorization import UserGroup
 from app.models.authorization import UserOrganisation
 
 
-def get_user(user_id, id_key: str = 'id'):
+def get_user(user_id, id_key: str = 'id') -> [User, None]:
     user = User.query.filter(getattr(User, id_key) == user_id).first()
     return user
 
 
-def get_active_user_by_login(username):
+def get_active_user(user_id, id_key: str = 'id') -> [User, None]:
     user = User.query.filter(
-        User.user == username,
-        User.active == True
-    ).first()
+        and_(
+            getattr(User, id_key) == user_id,
+            User.active == True
+        )).first()
     return user
+
+
+def get_active_user_by_login(username):
+    return get_active_user(user_id=username, id_key='user')
 
 
 def list_users_id():
@@ -122,6 +127,27 @@ def update_user_groups(user_id, groups):
     db.session.commit()
 
     ac_auto_update_user_effective_access(user_id)
+
+def add_user_to_customer(user_id, customer_id):
+    user_client = UserClient.query.filter(
+        UserClient.user_id == user_id,
+        UserClient.client_id == customer_id
+    ).first()
+
+    if user_client:
+        return True
+
+    user_client = UserClient()
+    user_client.user_id = user_id
+    user_client.client_id = customer_id
+    user_client.access_level = CaseAccessLevel.full_access.value
+    user_client.allow_alerts = True
+    db.session.add(user_client)
+    db.session.commit()
+
+    ac_auto_update_user_effective_access(user_id)
+
+    return True
 
 
 def update_user_customers(user_id, customers):
@@ -673,6 +699,10 @@ def update_user(user: User, name: str = None, email: str = None, password: str =
 
 
 def delete_user(user_id):
+    # Migrate the user activity to a shadow user
+
+    UserActivity.query.filter(UserActivity.user_id == user_id).update({UserActivity.user_id: None})
+
     UserCaseAccess.query.filter(UserCaseAccess.user_id == user_id).delete()
     UserOrganisation.query.filter(UserOrganisation.user_id == user_id).delete()
     UserGroup.query.filter(UserGroup.user_id == user_id).delete()

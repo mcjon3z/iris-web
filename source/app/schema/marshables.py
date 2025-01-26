@@ -19,6 +19,7 @@ import datetime
 import dateutil.parser
 import marshmallow
 import os
+import psycopg2
 import pyminizip
 import random
 import re
@@ -26,7 +27,7 @@ import shutil
 import string
 import tempfile
 from flask_login import current_user
-from marshmallow import ValidationError
+from marshmallow import ValidationError, EXCLUDE
 from marshmallow import fields
 from marshmallow import post_load
 from marshmallow import pre_load
@@ -34,6 +35,7 @@ from marshmallow.validate import Length
 from marshmallow_sqlalchemy import auto_field
 from pathlib import Path
 from sqlalchemy import func
+from sqlalchemy.orm import aliased
 from typing import Any, Dict, List, Optional, Tuple, Union
 from werkzeug.datastructures import FileStorage
 
@@ -45,7 +47,7 @@ from app.datamgmt.manage.manage_attribute_db import merge_custom_attributes
 from app.datamgmt.manage.manage_tags_db import add_db_tag
 from app.iris_engine.access_control.utils import ac_mask_from_val_list
 from app.models import AnalysisStatus, CaseClassification, SavedFilter, DataStorePath, IrisModuleHook, Tags, \
-    ReviewStatus, EvidenceTypes, CaseStatus, NoteDirectory
+    ReviewStatus, EvidenceTypes, CaseStatus, NoteDirectory, NoteRevisions
 from app.models import AssetsType
 from app.models import CaseAssets
 from app.models import CaseReceivedFile
@@ -75,6 +77,8 @@ from app.util import file_sha256sum, str_to_bool, assert_type_mml
 from app.util import stream_sha256sum
 
 ALLOWED_EXTENSIONS = {'png', 'svg'}
+POSTGRES_INT_MAX = 2147483647
+POSTGRES_BIGINT_MAX = 9223372036854775807
 
 log = app.logger
 
@@ -152,12 +156,12 @@ class CaseNoteDirectorySchema(ma.SQLAlchemyAutoSchema):
     It also includes a method for verifying the directory name.
 
     """
-    csrf_token: str = fields.String(required=False)
 
     class Meta:
         model = NoteDirectory
         load_instance = True
         include_fk = True
+        unknown = EXCLUDE
 
     def verify_parent_id(self, parent_id, case_id, current_id=None):
 
@@ -222,7 +226,6 @@ class UserSchema(ma.SQLAlchemyAutoSchema):
     user_email: str = auto_field('email', required=True, validate=Length(min=2))
     user_password: Optional[str] = auto_field('password', required=False)
     user_isadmin: bool = fields.Boolean(required=True)
-    csrf_token: Optional[str] = fields.String(required=False)
     user_id: Optional[int] = fields.Integer(required=False)
     user_primary_organisation_id: Optional[int] = fields.Integer(required=False)
     user_is_service_account: Optional[bool] = auto_field('is_service_account', required=False)
@@ -232,6 +235,7 @@ class UserSchema(ma.SQLAlchemyAutoSchema):
         load_instance = True
         include_fk = True
         exclude = ['api_key', 'password', 'ctx_case', 'ctx_human_case', 'user', 'name', 'email', 'is_service_account']
+        unknown = EXCLUDE
 
     @pre_load()
     def verify_username(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
@@ -384,6 +388,18 @@ class CommentSchema(ma.SQLAlchemyAutoSchema):
         model = Comments
         load_instance = True
         include_fk = True
+        unknown = EXCLUDE
+
+
+class CaseNoteRevisionSchema(ma.SQLAlchemyAutoSchema):
+    """Schema for serializing and deserializing CaseNoteVersion objects."""
+    user_name = fields.String()
+
+    class Meta:
+        model = NoteRevisions
+        load_instance = True
+        include_fk = True
+        unknown = EXCLUDE
 
 
 class CaseNoteSchema(ma.SQLAlchemyAutoSchema):
@@ -393,7 +409,6 @@ class CaseNoteSchema(ma.SQLAlchemyAutoSchema):
     It includes fields for the CSRF token, group ID, group UUID, and group title.
 
     """
-    csrf_token: str = fields.String(required=False)
     comments = fields.Nested('CommentSchema', many=True)
     directory = fields.Nested('CaseNoteDirectorySchema', many=False)
 
@@ -401,6 +416,7 @@ class CaseNoteSchema(ma.SQLAlchemyAutoSchema):
         model = Notes
         load_instance = True
         include_fk = True
+        unknown = EXCLUDE
 
     def verify_directory_id(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
         """Verifies that the directory ID is valid.
@@ -471,7 +487,6 @@ class CaseAddNoteSchema(ma.Schema):
     note_id: int = fields.Integer(required=False)
     note_title: str = fields.String(required=True, validate=Length(min=1, max=154), allow_none=False)
     note_content: str = fields.String(required=False)
-    csrf_token: str = fields.String(required=False)
     custom_attributes: Dict[str, Any] = fields.Dict(required=False)
 
 
@@ -544,6 +559,7 @@ class CaseGroupNoteSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = NotesGroup
         load_instance = True
+        unknown = EXCLUDE
 
 
 class AssetTypeSchema(ma.SQLAlchemyAutoSchema):
@@ -555,7 +571,6 @@ class AssetTypeSchema(ma.SQLAlchemyAutoSchema):
     loading and storing asset icons.
 
     """
-    csrf_token: str = fields.String(required=False)
     asset_name: str = auto_field('asset_name', required=True, validate=Length(min=2), allow_none=False)
     asset_description: str = auto_field('asset_description', required=True, validate=Length(min=2), allow_none=False)
     asset_icon_compromised: str = auto_field('asset_icon_compromised')
@@ -564,6 +579,7 @@ class AssetTypeSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = AssetsType
         load_instance = True
+        unknown = EXCLUDE
 
     @post_load
     def verify_unique(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
@@ -650,11 +666,82 @@ class CaseAssetsSchema(ma.SQLAlchemyAutoSchema):
     ioc_links: List[int] = fields.List(fields.Integer, required=False)
     asset_enrichment: str = auto_field('asset_enrichment', required=False)
     asset_type: AssetTypeSchema = ma.Nested(AssetTypeSchema, required=False)
+    alerts = fields.Nested('AlertSchema', many=True, exclude=['assets'])
+    analysis_status = fields.Nested('AnalysisStatusSchema', required=False)
 
     class Meta:
         model = CaseAssets
         include_fk = True
         load_instance = True
+        unknown = EXCLUDE
+
+    @staticmethod
+    def is_unique_for_customer(customer_id, request_data):
+        """
+        Check if the asset is unique for the customer
+        """
+
+        if request_data.get('asset_name') is None:
+            raise marshmallow.exceptions.ValidationError("Asset name is required",
+                                                         field_name="asset_name")
+
+        case_alias = aliased(Cases)
+        asset_alias = aliased(CaseAssets)
+
+        asset = db.session.query(
+            asset_alias.asset_id
+        ).join(
+            case_alias, asset_alias.case_id == case_alias.case_id
+        ).filter(
+            func.lower(asset_alias.asset_name) == request_data.get('asset_name').lower(),
+            asset_alias.asset_type_id == request_data.get('asset_type_id'),
+            asset_alias.asset_id != request_data.get('asset_id'),
+            case_alias.client_id == customer_id
+        ).first()
+        if asset is not None:
+            return asset
+
+        return None
+
+    def is_unique_for_customer_from_cid(self, case_id, request_data):
+        """
+        Check if the asset is unique for the customer
+        """
+
+        case_alias = aliased(Cases)
+
+        customer_id = db.session.query(
+            case_alias.client_id
+        ).filter(
+            case_alias.case_id == case_id
+        ).first()
+
+        if customer_id is None:
+            raise marshmallow.exceptions.ValidationError("Case not found")
+
+        customer_id = customer_id[0]
+
+        return self.is_unique_for_customer(customer_id, request_data)
+
+    @staticmethod
+    def is_unique_for_cid(case_id, request_data):
+        """
+        Check if the asset is unique for the customer
+        """
+
+        asset = CaseAssets.query.filter(
+            func.lower(CaseAssets.asset_name) == func.lower(request_data.get('asset_name')),
+            CaseAssets.asset_type_id == request_data.get('asset_type_id'),
+            CaseAssets.asset_id != request_data.get('asset_id'),
+            CaseAssets.case_id == case_id
+        ).first()
+
+        if asset is not None:
+            raise marshmallow.exceptions.ValidationError("Asset name already exists in this case",
+                                                         field_name="asset_name")
+
+        return True
+
 
     @pre_load
     def verify_data(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
@@ -828,6 +915,7 @@ class IocTypeSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = IocType
         load_instance = True
+        unknown = EXCLUDE
 
     @post_load
     def verify_unique(self, data: IocType, **kwargs: Any) -> IocType:
@@ -876,6 +964,7 @@ class IocSchema(ma.SQLAlchemyAutoSchema):
         model = Ioc
         load_instance = True
         include_fk = True
+        unknown = EXCLUDE
 
     @pre_load
     def verify_data(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
@@ -897,27 +986,23 @@ class IocSchema(ma.SQLAlchemyAutoSchema):
             TLP ID are invalid.
 
         """
-        assert_type_mml(input_var=data.get('ioc_type_id'),
-                        field_name="ioc_type_id",
-                        type=int)
+        if data.get('ioc_type_id'):
+            assert_type_mml(input_var=data.get('ioc_type_id'), field_name="ioc_type_id", type=int)
+            ioc_type = IocType.query.filter(IocType.type_id == data.get('ioc_type_id')).first()
+            if not ioc_type:
+                raise marshmallow.exceptions.ValidationError("Invalid IOC type ID", field_name="ioc_type_id")
 
-        ioc_type = IocType.query.filter(IocType.type_id == data.get('ioc_type_id')).first()
-        if not ioc_type:
-            raise marshmallow.exceptions.ValidationError("Invalid ioc type ID", field_name="ioc_type_id")
+            if ioc_type.type_validation_regex:
+                if not re.fullmatch(ioc_type.type_validation_regex, data.get('ioc_value'), re.IGNORECASE):
+                    error = f"The input doesn\'t match the expected format " \
+                            f"(expected: {ioc_type.type_validation_expect or ioc_type.type_validation_regex})"
+                    raise marshmallow.exceptions.ValidationError(error, field_name="ioc_ioc_value")
 
-        assert_type_mml(input_var=data.get('ioc_tlp_id'),
-                        field_name="ioc_tlp_id",
-                        type=int)
+        if data.get('ioc_tlp_id'):
+            assert_type_mml(input_var=data.get('ioc_tlp_id'), field_name="ioc_tlp_id", type=int,
+                            max_val=POSTGRES_INT_MAX)
 
-        tlp_id = Tlp.query.filter(Tlp.tlp_id == data.get('ioc_tlp_id')).count()
-        if not tlp_id:
-            raise marshmallow.exceptions.ValidationError("Invalid TLP ID", field_name="ioc_tlp_id")
-
-        if ioc_type.type_validation_regex:
-            if not re.fullmatch(ioc_type.type_validation_regex, data.get('ioc_value'), re.IGNORECASE):
-                error = f"The input doesn\'t match the expected format " \
-                        f"(expected: {ioc_type.type_validation_expect or ioc_type.type_validation_regex})"
-                raise marshmallow.exceptions.ValidationError(error, field_name="ioc_ioc_value")
+            Tlp.query.filter(Tlp.tlp_id == data.get('ioc_tlp_id')).count()
 
         if data.get('ioc_tags'):
             for tag in data.get('ioc_tags').split(','):
@@ -969,6 +1054,7 @@ class UserFullSchema(ma.SQLAlchemyAutoSchema):
         load_instance = True
         include_fk = True
         exclude = ['password', 'ctx_case', 'ctx_human_case']
+        unknown = EXCLUDE
 
 
 class EventSchema(ma.SQLAlchemyAutoSchema):
@@ -996,6 +1082,7 @@ class EventSchema(ma.SQLAlchemyAutoSchema):
         model = CasesEvent
         load_instance = True
         include_fk = True
+        unknown = EXCLUDE
 
     def validate_date(self, event_date: str, event_tz: str):
         """Validates the date and time of the event.
@@ -1138,6 +1225,7 @@ class DSPathSchema(ma.SQLAlchemyAutoSchema):
         model = DataStorePath
         load_instance = True
         include_fk = True
+        unknown = EXCLUDE
 
 
 class DSFileSchema(ma.SQLAlchemyAutoSchema):
@@ -1147,7 +1235,6 @@ class DSFileSchema(ma.SQLAlchemyAutoSchema):
     It includes fields for the file ID, the original file name, the file description, and the file content.
 
     """
-    csrf_token: Optional[str] = fields.String(required=False)
     file_original_name: str = auto_field('file_original_name', required=True, validate=Length(min=1), allow_none=False)
     file_description: str = auto_field('file_description', allow_none=False)
     file_content: Optional[bytes] = fields.Raw(required=False)
@@ -1156,6 +1243,7 @@ class DSFileSchema(ma.SQLAlchemyAutoSchema):
         model = DataStoreFile
         include_fk = True
         load_instance = True
+        unknown = EXCLUDE
 
     def ds_store_file_b64(self, filename: str, file_content: bytes, dsp: DataStorePath, cid: int) -> Tuple[
         DataStoreFile, bool]:
@@ -1323,6 +1411,7 @@ class ServerSettingsSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = ServerSettings
         load_instance = True
+        unknown = EXCLUDE
 
 
 class ContactSchema(ma.SQLAlchemyAutoSchema):
@@ -1343,6 +1432,7 @@ class ContactSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = Contact
         load_instance = True
+        unknown = EXCLUDE
 
 
 class CaseClassificationSchema(ma.SQLAlchemyAutoSchema):
@@ -1359,6 +1449,7 @@ class CaseClassificationSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = CaseClassification
         load_instance = True
+        unknown = EXCLUDE
 
     @post_load
     def verify_unique(self, data, **kwargs):
@@ -1402,6 +1493,7 @@ class EvidenceTypeSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = EvidenceTypes
         load_instance = True
+        unknown = EXCLUDE
 
     @post_load
     def verify_unique(self, data, **kwargs):
@@ -1447,16 +1539,17 @@ class CaseSchema(ma.SQLAlchemyAutoSchema):
     case_organisations: List[int] = fields.List(fields.Integer, required=False)
     protagonists: List[Dict[str, Any]] = fields.List(fields.Dict, required=False)
     case_tags: Optional[str] = fields.String(required=False)
-    csrf_token: Optional[str] = fields.String(required=False)
     initial_date: Optional[datetime.datetime] = auto_field('initial_date', required=False)
     classification_id: Optional[int] = auto_field('classification_id', required=False, allow_none=True)
     reviewer_id: Optional[int] = auto_field('reviewer_id', required=False, allow_none=True)
+    severity_id: Optional[int] = auto_field('severity_id', required=False, allow_none=True)
 
     class Meta:
         model = Cases
         include_fk = True
         load_instance = True
         exclude = ['name', 'description', 'soc_id', 'client_id', 'initial_date']
+        unknown = EXCLUDE
 
     @pre_load
     def classification_filter(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
@@ -1555,6 +1648,7 @@ class CaseStateSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = CaseState
         load_instance = True
+        unknown = EXCLUDE
 
 
 class GlobalTasksSchema(ma.SQLAlchemyAutoSchema):
@@ -1567,13 +1661,13 @@ class GlobalTasksSchema(ma.SQLAlchemyAutoSchema):
     task_id: int = auto_field('id')
     task_assignee_id: int = auto_field('task_assignee_id', required=True, allow_none=False)
     task_title: str = auto_field('task_title', required=True, validate=Length(min=2), allow_none=False)
-    csrf_token: Optional[str] = fields.String(required=False)
 
     class Meta:
         model = GlobalTasks
         include_fk = True
         load_instance = True
         exclude = ['id']
+        unknown = EXCLUDE
 
     @pre_load
     def verify_data(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
@@ -1624,12 +1718,12 @@ class CustomerSchema(ma.SQLAlchemyAutoSchema):
     customer_description: Optional[str] = auto_field('description', allow_none=True)
     customer_sla: Optional[str] = auto_field('sla', allow_none=True)
     customer_id: int = auto_field('client_id')
-    csrf_token: Optional[str] = fields.String(required=False)
 
     class Meta:
         model = Client
         load_instance = True
         exclude = ['name', 'client_id', 'description', 'sla']
+        unknown = EXCLUDE
 
     @post_load
     def verify_unique(self, data: Client, **kwargs: Any) -> Client:
@@ -1710,10 +1804,10 @@ class TaskLogSchema(ma.Schema):
 
     """
     log_content: Optional[str] = fields.String(required=False, validate=Length(min=1))
-    csrf_token: Optional[str] = fields.String(required=False)
 
     class Meta:
         load_instance = True
+        unknown = EXCLUDE
 
 
 class CaseTaskSchema(ma.SQLAlchemyAutoSchema):
@@ -1727,12 +1821,12 @@ class CaseTaskSchema(ma.SQLAlchemyAutoSchema):
     task_status_id: int = auto_field('task_status_id', required=True)
     task_assignees_id: Optional[List[int]] = fields.List(fields.Integer, required=False, allow_none=True)
     task_assignees: Optional[List[Dict[str, Any]]] = fields.List(fields.Dict, required=False, allow_none=True)
-    csrf_token: Optional[str] = fields.String(required=False)
 
     class Meta:
         model = CaseTasks
         load_instance = True
         include_fk = True
+        unknown = EXCLUDE
 
     @pre_load
     def verify_data(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
@@ -1811,7 +1905,6 @@ class CaseEvidenceSchema(ma.SQLAlchemyAutoSchema):
 
     """
     filename: str = auto_field('filename', required=True, validate=Length(min=2), allow_none=False)
-    csrf_token: Optional[str] = fields.String(required=False)
     type = ma.Nested(EvidenceTypeSchema)
     user = ma.Nested(UserSchema, only=['id', 'user_name', 'user_login', 'user_email'])
 
@@ -1820,6 +1913,7 @@ class CaseEvidenceSchema(ma.SQLAlchemyAutoSchema):
         load_instance = True
         include_relationships = True
         include_fk = True
+        unknown = EXCLUDE
 
     @post_load
     def custom_attributes_merge(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
@@ -1874,6 +1968,7 @@ class AuthorizationGroupSchema(ma.SQLAlchemyAutoSchema):
         model = Group
         load_instance = True
         include_fk = True
+        unknown = EXCLUDE
 
     @pre_load
     def verify_unique(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
@@ -1951,6 +2046,7 @@ class AuthorizationOrganisationSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = Organisation
         load_instance = True
+        unknown = EXCLUDE
 
     @pre_load
     def verify_unique(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
@@ -2007,6 +2103,7 @@ class BasicUserSchema(ma.SQLAlchemyAutoSchema):
         load_instance = True
         exclude = ['password', 'api_key', 'ctx_case', 'ctx_human_case', 'active', 'external_id', 'in_dark_mode',
                    'id', 'name', 'email', 'user', 'uuid']
+        unknown = EXCLUDE
 
 
 def validate_ioc_type(type_id: int) -> None:
@@ -2088,6 +2185,7 @@ class SeveritySchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = Severity
         load_instance = True
+        unknown = EXCLUDE
 
 
 class AlertStatusSchema(ma.SQLAlchemyAutoSchema):
@@ -2101,6 +2199,7 @@ class AlertStatusSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = AlertStatus
         load_instance = True
+        unknown = EXCLUDE
 
 
 class AlertResolutionSchema(ma.SQLAlchemyAutoSchema):
@@ -2114,6 +2213,7 @@ class AlertResolutionSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = AlertResolutionStatus
         load_instance = True
+        unknown = EXCLUDE
 
 
 class AnalysisStatusSchema(ma.SQLAlchemyAutoSchema):
@@ -2127,6 +2227,7 @@ class AnalysisStatusSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = AnalysisStatus
         load_instance = True
+        unknown = EXCLUDE
 
 
 class EventCategorySchema(ma.SQLAlchemyAutoSchema):
@@ -2140,6 +2241,7 @@ class EventCategorySchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = EventCategory
         load_instance = True
+        unknown = EXCLUDE
 
 
 class AlertSchema(ma.SQLAlchemyAutoSchema):
@@ -2163,6 +2265,7 @@ class AlertSchema(ma.SQLAlchemyAutoSchema):
         include_relationships = True
         include_fk = True
         load_instance = True
+        unknown = EXCLUDE
 
     @pre_load
     def verify_data(self, data: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
@@ -2191,12 +2294,14 @@ class SavedFilterSchema(ma.SQLAlchemyAutoSchema):
         load_instance = True
         include_fk = True
         include_relationships = True
+        unknown = EXCLUDE
 
 
 class IrisModuleSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = IrisModule
         load_instance = True
+        unknown = EXCLUDE
 
 
 class ModuleHooksSchema(ma.SQLAlchemyAutoSchema):
@@ -2211,6 +2316,7 @@ class ModuleHooksSchema(ma.SQLAlchemyAutoSchema):
         load_instance = True
         include_fk = True
         include_relationships = True
+        unknown = EXCLUDE
 
 
 class TagsSchema(ma.SQLAlchemyAutoSchema):
@@ -2219,6 +2325,7 @@ class TagsSchema(ma.SQLAlchemyAutoSchema):
         load_instance = True
         include_fk = True
         include_relationships = True
+        unknown = EXCLUDE
 
 
 class ReviewStatusSchema(ma.SQLAlchemyAutoSchema):
@@ -2227,6 +2334,7 @@ class ReviewStatusSchema(ma.SQLAlchemyAutoSchema):
         load_instance = True
         include_fk = True
         include_relationships = True
+        unknown = EXCLUDE
 
 
 class CaseProtagonistSchema(ma.SQLAlchemyAutoSchema):
@@ -2277,3 +2385,4 @@ class CaseDetailsSchema(ma.SQLAlchemyAutoSchema):
         include_fk = True
         load_instance = True
         include_relationships = True
+        unknown = EXCLUDE

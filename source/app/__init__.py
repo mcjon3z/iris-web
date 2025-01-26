@@ -34,6 +34,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from app.flask_dropzone import Dropzone
 from app.iris_engine.tasker.celery import make_celery
+from app.iris_engine.access_control.oidc_handler import get_oidc_client
 
 
 class ReverseProxied(object):
@@ -98,7 +99,8 @@ app.config.from_object('app.configuration.Config')
 cache = Cache(app)
 
 SQLALCHEMY_ENGINE_OPTIONS = {
-    "json_deserializer": partial(json.loads, object_pairs_hook=collections.OrderedDict)
+    "json_deserializer": partial(json.loads, object_pairs_hook=collections.OrderedDict),
+    "pool_pre_ping": True
 }
 
 db = SQLAlchemy(app, engine_options=SQLALCHEMY_ENGINE_OPTIONS)  # flask-sqlalchemy
@@ -127,9 +129,13 @@ socket_io = SocketIO(app, cors_allowed_origins="*")
 alerts_namespace = AlertsNamespace('/alerts')
 socket_io.on_namespace(alerts_namespace)
 
+oidc_client = None
+if app.config.get('AUTHENTICATION_TYPE') == "oidc":
+    oidc_client = get_oidc_client(app)
 
 @app.teardown_appcontext
 def shutdown_session(exception=None):
     db.session.remove()
+
 
 from app import views
